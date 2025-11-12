@@ -1,0 +1,35 @@
+{
+    "version": 1,
+    "name": "InputActions",
+    "maps": [
+        {
+            "name": "dash",
+            "id": "f7f94123-396b-4428-9478-9f870dfc3593",
+            "actions": [
+                {
+                    "name": "New action",
+                    "type": "Button",
+                    "id": "470a4fff-1393-446f-9848-fe87f87a3d5b",
+                    "expectedControlType": "",
+                    "processors": "",
+                    "interactions": "",
+                    "initialStateCheck": false
+                }
+            ],
+            "bindings": [
+                {
+                    "name": "",
+                    "id": "b355d67e-7efa-4e8e-94ee-fd95416c73e2",
+                    "path": "<Keyboard>/e",
+                    "interactions": "",
+                    "processors": "",
+                    "groups": "",
+                    "action": "New action",
+                    "isComposite": false,
+                    "isPartOfComposite": false
+                }
+            ]
+        }
+    ],
+    "controlSchemes": []
+}
