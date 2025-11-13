@@ -1,295 +1,323 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
 
-[RequireComponent(typeof(PlayerInput))]
 [RequireComponent(typeof(Rigidbody))]
-[RequireComponent(typeof(Collider))]
-[RequireComponent(typeof(WallDetection))]
+[RequireComponent(typeof(CapsuleCollider))]
 public class PlayerMovement : MonoBehaviour
 {
-    private Rigidbody body;
-    private Collider bodyCollider;
-    private WallDetection wallDetection;
+    [Header("References")]
+    private Rigidbody rb;
+    private CapsuleCollider capsuleCollider;
+    private PlayerInput playerInput;
+    private InputAction moveAction;
+    private InputAction lookAction;
+    private InputAction jumpAction;
+    private InputAction dashAction;
+    private InputAction landAction;
 
-    public float moveMentSpeed;
-    public float jumpFactor;
-    protected Vector3 currentInput;
+    [Header("Movement Settings")]
+    public float moveSpeed = 5f;
+    public float sprintSpeed = 8f;
+    public float rotationSpeed = 10f;
+    private Vector2 moveInput;
+    private bool isSprinting;
 
-    public float fallMultiplier = 2.5f;
-
-    [Header("Look Settings")]
-    public Camera playerCamera;
-    public float lookSensitivity = 100f;
-    private float xRotation = 0f;
+    [Header("Camera Settings")]
+    public Transform cameraTransform;
+    public float lookSensitivity = 1f;
+    private Vector2 lookInput;
+    private float cameraPitch = 0f;
 
     [Header("Jump Settings")]
+    public float jumpForce = 10f;
+    public float gravity = -20f;
+    public float fallMultiplier = 2.5f;
+
+    [Header("Ground Detection")]
     public LayerMask groundLayer;
-    public float groundCheckDistance = 0.2f;
-    public float groundCheckRadius = 0.12f;
+    public float groundCheckDistance = 0.3f;
+    public float groundCheckRadius = 0.4f;
     private bool isGrounded;
-    private int jumpsRemaining;
-    private int maxJumps = 2;
+    private bool wasGrounded; // To detect when we just landed
 
-    [Tooltip("How much horizontal speed affects jump force (0 = no effect, 0.1 = 10% boost per unit of speed)")]
-    public float momentumJumpBonus = 0.1f;
+    [Header("Dash Settings")]
+    public float dashForce = 15f;
+    public float dashDuration = 0.3f;
+    public float dashCooldown = 1f;
+    private bool isDashing;
+    private float dashTimer;
+    private float dashCooldownTimer;
 
-    [Header("Wall Run Settings")]
-    public float wallRunSpeed = 8f;
-    [Tooltip("Upward force to fight gravity while wall running")]
-    public float wallRunGravityCounter = 5f;
-    [Tooltip("How long can you wall run before falling (seconds)")]
-    public float maxWallRunDuration = 2f;
-    [Tooltip("Force applied when jumping off a wall")]
-    public float wallJumpForce = 15f;
-    [Tooltip("How much force pushes you away from wall when jumping")]
-    public float wallJumpAwayForce = 8f;
-
-    private bool isWallRunning = false;
-    private float wallRunTimer = 0f;
-    private Vector3 wallRunDirection; // Direction we're running along the wall
-
-    [Header("Wall Climb Settings")]
-    public float wallClimbSpeed = 5f;
-    public float maxWallClimbDuration = 1.5f;
-    private bool isWallClimbing = false;
-    private float wallClimbTimer = 0f;
+    [Header("Landing Settings")]
+    public float landingTimeWindow = 0.5f; // Time before landing to press E
+    public float landingDetectionHeight = 2f; // How far to raycast down
+    public float stickLandingStopForce = 0.9f; // How much to reduce momentum (0-1)
+    private bool isPreparingLanding; // Player pressed E in time window
+    private bool canPrepareLanding; // Are we close enough to ground?
 
     private void Awake()
     {
-        body = GetComponent<Rigidbody>();
-        bodyCollider = GetComponent<Collider>();
-        wallDetection = GetComponent<WallDetection>();
-        jumpsRemaining = maxJumps;
+        rb = GetComponent<Rigidbody>();
+        capsuleCollider = GetComponent<CapsuleCollider>();
+        playerInput = GetComponent<PlayerInput>();
+
+        // Get input actions
+        moveAction = playerInput.actions["Move"];
+        lookAction = playerInput.actions["Look"];
+        jumpAction = playerInput.actions["Jump"];
+        dashAction = playerInput.actions["Dash"];
+        landAction = playerInput.actions["Land"];
+
+        // Lock cursor
+        Cursor.lockState = CursorLockMode.Locked;
+        Cursor.visible = false;
+    }
+
+    private void OnEnable()
+    {
+        jumpAction.performed += OnJump;
+        dashAction.performed += OnDash;
+        landAction.performed += OnLand;
+    }
+
+    private void OnDisable()
+    {
+        jumpAction.performed -= OnJump;
+        dashAction.performed -= OnDash;
+        landAction.performed -= OnLand;
+    }
+
+    private void Update()
+    {
+        // Read inputs
+        moveInput = moveAction.ReadValue<Vector2>();
+        lookInput = lookAction.ReadValue<Vector2>();
+        isSprinting = playerInput.actions["Sprint"].IsPressed();
+
+        // Handle camera look
+        HandleCameraLook();
+
+        // Update timers
+        if (dashCooldownTimer > 0)
+            dashCooldownTimer -= Time.deltaTime;
+
+        if (isDashing)
+        {
+            dashTimer -= Time.deltaTime;
+            if (dashTimer <= 0)
+                isDashing = false;
+        }
+
+        // Check if we can prepare landing (are we close to ground while falling?)
+        CheckLandingWindow();
+
+        // Store previous grounded state
+        wasGrounded = isGrounded;
     }
 
     private void FixedUpdate()
     {
         CheckGroundStatus();
 
-        // Handle wall run physics
-        if (isWallRunning)
+        // Reset landing prep if we landed
+        if (isGrounded && !wasGrounded)
         {
-            UpdateWallRun();
+            HandleLanding();
         }
-        // Handle wall climb physics
-        else if (isWallClimbing)
+
+        if (isDashing)
         {
-            UpdateWallClimb();
+            // During dash, physics is handled by dash force
+            return;
         }
-        // Normal movement
+
+        HandleMovement();
+        ApplyGravity();
+    }
+
+    private void HandleMovement()
+    {
+        if (isDashing) return;
+
+        // Calculate movement direction relative to camera
+        Vector3 cameraForward = cameraTransform.forward;
+        Vector3 cameraRight = cameraTransform.right;
+
+        // Flatten camera directions (no vertical component)
+        cameraForward.y = 0f;
+        cameraRight.y = 0f;
+        cameraForward.Normalize();
+        cameraRight.Normalize();
+
+        // Calculate desired movement direction
+        Vector3 moveDirection = (cameraForward * moveInput.y + cameraRight * moveInput.x).normalized;
+
+        if (moveDirection.magnitude > 0.1f)
+        {
+            // Rotate player to face movement direction
+            Quaternion targetRotation = Quaternion.LookRotation(moveDirection);
+            transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, rotationSpeed * Time.fixedDeltaTime);
+
+            // Apply movement
+            float currentSpeed = isSprinting ? sprintSpeed : moveSpeed;
+            Vector3 targetVelocity = moveDirection * currentSpeed;
+
+            // Keep vertical velocity, only change horizontal
+            rb.linearVelocity = new Vector3(targetVelocity.x, rb.linearVelocity.y, targetVelocity.z);
+        }
         else
         {
-            Vector3 moveDirection = transform.right * currentInput.x + transform.forward * currentInput.z;
-            Vector3 horizontalVelocity = moveDirection * moveMentSpeed;
-            body.linearVelocity = new Vector3(horizontalVelocity.x, body.linearVelocity.y, horizontalVelocity.z);
-        }
-
-        // Enhanced falling (only when not wall interacting)
-        if (body.linearVelocity.y < 0 && !isWallRunning && !isWallClimbing)
-        {
-            body.linearVelocity += Vector3.up * Physics.gravity.y * (fallMultiplier - 1) * Time.fixedDeltaTime;
+            // Stop horizontal movement when no input
+            rb.linearVelocity = new Vector3(0, rb.linearVelocity.y, 0);
         }
     }
 
-    private void UpdateWallRun()
+    private void HandleCameraLook()
     {
-        wallRunTimer += Time.fixedDeltaTime;
+        if (cameraTransform == null) return;
 
-        // Check if wall run should end
-        if (wallRunTimer >= maxWallRunDuration || !wallDetection.IsNearRunnableWall())
-        {
-            StopWallRun();
-            return;
-        }
+        // Horizontal rotation (rotate player body)
+        float yaw = lookInput.x * lookSensitivity * Time.deltaTime;
+        transform.Rotate(Vector3.up * yaw);
 
-        // Calculate wall run direction (perpendicular to wall normal)
-        Vector3 wallNormal = wallDetection.GetWallNormal();
-        // Run along the wall, perpendicular to its surface
-        wallRunDirection = Vector3.Cross(wallNormal, Vector3.up).normalized;
-
-        // Determine which direction to run based on player's current velocity
-        if (Vector3.Dot(body.linearVelocity, wallRunDirection) < 0)
-        {
-            wallRunDirection = -wallRunDirection;
-        }
-
-        // Apply wall run movement
-        Vector3 wallRunVelocity = wallRunDirection * wallRunSpeed;
-
-        // Counter gravity with upward force (gradually weakens over time)
-        float gravityCounterStrength = Mathf.Lerp(wallRunGravityCounter, 0, wallRunTimer / maxWallRunDuration);
-        float upwardForce = gravityCounterStrength;
-
-        body.linearVelocity = new Vector3(wallRunVelocity.x, upwardForce, wallRunVelocity.z);
-
-        Debug.DrawRay(transform.position, wallRunDirection * 2f, Color.cyan);
+        // Vertical rotation (rotate camera)
+        cameraPitch -= lookInput.y * lookSensitivity * Time.deltaTime;
+        cameraPitch = Mathf.Clamp(cameraPitch, -80f, 80f);
+        cameraTransform.localRotation = Quaternion.Euler(cameraPitch, 0f, 0f);
     }
 
-    private void UpdateWallClimb()
+    private void ApplyGravity()
     {
-        wallClimbTimer += Time.fixedDeltaTime;
-
-        // Check if climb should end
-        if (wallClimbTimer >= maxWallClimbDuration || !wallDetection.IsNearClimbableWall())
+        if (!isGrounded)
         {
-            StopWallClimb();
-            return;
+            // Enhanced falling
+            if (rb.linearVelocity.y < 0)
+            {
+                rb.linearVelocity += Vector3.up * gravity * fallMultiplier * Time.fixedDeltaTime;
+            }
+            else
+            {
+                rb.linearVelocity += Vector3.up * gravity * Time.fixedDeltaTime;
+            }
         }
-
-        // Climb upward with decreasing strength over time
-        float climbStrength = Mathf.Lerp(wallClimbSpeed, 0, wallClimbTimer / maxWallClimbDuration);
-
-        // Kill horizontal velocity, only move up
-        body.linearVelocity = new Vector3(0, climbStrength, 0);
     }
 
     private void CheckGroundStatus()
     {
-        if (bodyCollider == null)
-        {
-            isGrounded = false;
-            return;
-        }
-
-        Vector3 spherePosition = body.position + Vector3.down * (bodyCollider.bounds.extents.y - 0.01f);
+        Vector3 spherePosition = transform.position + Vector3.down * (capsuleCollider.height / 2 - capsuleCollider.radius + groundCheckDistance);
         isGrounded = Physics.CheckSphere(spherePosition, groundCheckRadius, groundLayer, QueryTriggerInteraction.Ignore);
 
-        if (isGrounded)
+        // Debug visualization
+        Debug.DrawRay(transform.position, Vector3.down * groundCheckDistance, isGrounded ? Color.green : Color.red);
+    }
+
+    private void CheckLandingWindow()
+    {
+        // Only check if we're falling and not grounded
+        if (isGrounded || rb.linearVelocity.y >= 0)
         {
-            jumpsRemaining = maxJumps;
-            StopWallRun();
-            StopWallClimb();
-        }
-
-        Debug.DrawRay(spherePosition, Vector3.up * 0.05f, isGrounded ? Color.green : Color.red);
-        Debug.DrawRay(spherePosition + Vector3.left * 0.03f, Vector3.right * 0.06f, isGrounded ? Color.green : Color.red);
-    }
-
-    private void OnMove(InputValue value)
-    {
-        currentInput = new Vector3(value.Get<Vector2>().x, 0, value.Get<Vector2>().y);
-        print(currentInput.ToString());
-    }
-
-    private void OnLook(InputValue value)
-    {
-        Vector2 lookInput = value.Get<Vector2>();
-        float mouseX = lookInput.x * lookSensitivity * Time.deltaTime;
-        float mouseY = lookInput.y * lookSensitivity * Time.deltaTime;
-
-        xRotation -= mouseY;
-        xRotation = Mathf.Clamp(xRotation, -90f, 90f);
-
-        playerCamera.transform.localRotation = Quaternion.Euler(xRotation, 0f, 0f);
-        transform.Rotate(Vector3.up * mouseX);
-    }
-
-    private void OnJump()
-    {
-        // Wall jump (if already wall running/climbing)
-        if (isWallRunning)
-        {
-            PerformWallJump();
+            canPrepareLanding = false;
             return;
         }
 
-        if (isWallClimbing)
+        // Raycast down to see if we're close to ground
+        Vector3 rayStart = transform.position;
+        float checkDistance = landingDetectionHeight;
+
+        if (Physics.Raycast(rayStart, Vector3.down, out RaycastHit hit, checkDistance, groundLayer, QueryTriggerInteraction.Ignore))
         {
-            PerformWallJump();
+            // Calculate time to impact based on current fall speed
+            float timeToImpact = hit.distance / Mathf.Abs(rb.linearVelocity.y);
+
+            canPrepareLanding = timeToImpact <= landingTimeWindow;
+
+            // Debug visualization
+            Debug.DrawRay(rayStart, Vector3.down * hit.distance, canPrepareLanding ? Color.yellow : Color.blue);
+        }
+        else
+        {
+            canPrepareLanding = false;
+        }
+    }
+
+    private void HandleLanding()
+    {
+        if (isPreparingLanding)
+        {
+            // Successful stick landing!
+            Vector3 velocity = rb.linearVelocity;
+            velocity.x *= stickLandingStopForce;
+            velocity.z *= stickLandingStopForce;
+            rb.linearVelocity = velocity;
+
+            Debug.Log("STICK LANDING! Momentum reduced.");
+        }
+
+        // Reset landing prep
+        isPreparingLanding = false;
+        canPrepareLanding = false;
+    }
+
+    private void OnJump(InputAction.CallbackContext context)
+    {
+        if (isGrounded && !isDashing)
+        {
+            rb.linearVelocity = new Vector3(rb.linearVelocity.x, 0f, rb.linearVelocity.z); // Reset vertical velocity
+            rb.AddForce(Vector3.up * jumpForce, ForceMode.Impulse);
+            Debug.Log("JUMP!");
+        }
+    }
+
+    private void OnDash(InputAction.CallbackContext context)
+    {
+        // Can only dash if grounded and cooldown is ready
+        if (!isGrounded || isDashing || dashCooldownTimer > 0)
             return;
-        }
 
-        // Start wall interaction (when airborne and near wall)
-        if (!isGrounded)
+        isDashing = true;
+        dashTimer = dashDuration;
+        dashCooldownTimer = dashCooldown;
+
+        // Dash in the direction player is facing
+        Vector3 dashDirection = transform.forward;
+
+        // Apply dash force
+        rb.linearVelocity = new Vector3(0, rb.linearVelocity.y, 0); // Reset horizontal velocity
+        rb.AddForce(dashDirection * dashForce, ForceMode.Impulse);
+
+        Debug.Log("DASH!");
+    }
+
+    private void OnLand(InputAction.CallbackContext context)
+    {
+        // Can only prepare landing if in the time window
+        if (canPrepareLanding && !isGrounded)
         {
-            if (wallDetection.IsNearRunnableWall())
-            {
-                StartWallRun();
-                return;
-            }
-
-            if (wallDetection.IsNearClimbableWall())
-            {
-                StartWallClimb();
-                return;
-            }
+            isPreparingLanding = true;
+            Debug.Log("Landing prepared! Hit ground now for stick landing.");
         }
-        /*
-        // Normal jump logic
-        if (jumpsRemaining <= 0) return;
-
-        Vector3 horizontalVelocity = new Vector3(body.linearVelocity.x, 0, body.linearVelocity.z);
-        float currentSpeed = horizontalVelocity.magnitude;
-        float momentumBonus = 1f + (currentSpeed * momentumJumpBonus);
-
-        float finalJumpForce = jumpFactor * momentumBonus;
-        body.AddForce(Vector3.up * finalJumpForce, ForceMode.Impulse);
-
-        jumpsRemaining--;
-
-        Debug.Log($"Jump! Remaining: {jumpsRemaining}, Momentum Bonus: {momentumBonus:F2}x");
-        */
+        else if (isGrounded)
+        {
+            Debug.Log("Already grounded, can't prepare landing.");
+        }
+        else
+        {
+            Debug.Log("Too early! Get closer to ground.");
+        }
     }
 
-    private void StartWallRun()
+    // Visualize ground check in editor
+    private void OnDrawGizmosSelected()
     {
-        isWallRunning = true;
-        wallRunTimer = 0f;
+        if (capsuleCollider == null) return;
 
-        // Reset vertical velocity when starting wall run
-        body.linearVelocity = new Vector3(body.linearVelocity.x, 0, body.linearVelocity.z);
+        // Ground check sphere
+        Gizmos.color = Color.red;
+        Vector3 spherePosition = transform.position + Vector3.down * (capsuleCollider.height / 2 - capsuleCollider.radius + groundCheckDistance);
+        Gizmos.DrawWireSphere(spherePosition, groundCheckRadius);
 
-        Debug.Log("Started WALL RUN!");
+        // Landing detection range
+        Gizmos.color = Color.yellow;
+        Gizmos.DrawLine(transform.position, transform.position + Vector3.down * landingDetectionHeight);
     }
-
-    private void StopWallRun()
-    {
-        if (!isWallRunning) return;
-
-        isWallRunning = false;
-        wallRunTimer = 0f;
-        Debug.Log("Stopped wall run");
-    }
-
-    private void StartWallClimb()
-    {
-        isWallClimbing = true;
-        wallClimbTimer = 0f;
-
-        // Reset velocity when starting climb
-        body.linearVelocity = Vector3.zero;
-
-        Debug.Log("Started WALL CLIMB!");
-    }
-
-    private void StopWallClimb()
-    {
-        if (!isWallClimbing) return;
-
-        isWallClimbing = false;
-        wallClimbTimer = 0f;
-        Debug.Log("Stopped wall climb");
-    }
-
-    private void PerformWallJump()
-    {
-        Vector3 wallNormal = wallDetection.GetWallNormal();
-
-        // Jump up and away from wall
-        Vector3 jumpDirection = (Vector3.up + wallNormal).normalized;
-
-        // Stop current wall interaction
-        StopWallRun();
-        StopWallClimb();
-
-        // Apply jump force
-        body.linearVelocity = Vector3.zero; // Reset velocity first
-        body.AddForce(jumpDirection * wallJumpForce, ForceMode.Impulse);
-        body.AddForce(wallNormal * wallJumpAwayForce, ForceMode.Impulse);
-
-        Debug.Log("WALL JUMP!");
-    }
-
-    void Start() { }
-    void Update() { }
 }
